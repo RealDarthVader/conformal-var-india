@@ -61,7 +61,7 @@ Configuration is loaded from `config.yaml` with strict validation via Pydantic:
 ### Installation
 
 ```bash
-git clone https://github.com/UtkarshGupta-dev/conformal-var-india.git
+git clone https://github.com/RealDarthVader/conformal-var-india.git
 cd conformal-var-india
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
