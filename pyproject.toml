@@ -75,6 +75,8 @@ module = [
     "sklearn.*",
     "seaborn.*",
     "redis.*",
+    "tabulate",
+    "tabulate.*",
 ]
 ignore_missing_imports = true
 
