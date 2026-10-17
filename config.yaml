@@ -1,0 +1,28 @@
+target_quantiles:
+  - 0.05
+  - 0.01
+
+windows:
+  training_window: 756
+  calibration_window: 252
+
+market_regimes:
+  calm_bull:
+    start_date: "2017-01-01"
+    end_date: "2018-01-31"
+  ilfs_liquidity_crisis:
+    start_date: "2018-09-01"
+    end_date: "2019-03-31"
+  covid_crash:
+    start_date: "2020-02-01"
+    end_date: "2020-06-30"
+  rate_hike_tightening:
+    start_date: "2022-01-01"
+    end_date: "2022-12-31"
+
+data:
+  default_tickers:
+    - "^NSEI"
+    - "^NSEBANK"
+  storage_format: "parquet"
+  artifacts_dir: "artifacts"

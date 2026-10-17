@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Type checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific artifacts (keep folders with .gitkeep, ignore large caches/runs)
+artifacts/data/*.parquet
+artifacts/data/*.csv
+artifacts/plots/*.png
+artifacts/plots/*.svg
+artifacts/plots/*.pdf
+!artifacts/**/.gitkeep
