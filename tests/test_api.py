@@ -6,21 +6,63 @@ Verifies:
 3. Caching & Latency: Cache hit on second call with sub-millisecond response latency.
 4. Schema validation errors: Reject invalid weights (empty, negative, or sum to 0).
 5. GET /api/v1/benchmarks/regimes: Returns precomputed regime scorecard table.
+
+Design note: All tests are data-independent. A synthetic returns DataFrame is injected
+directly into ``app_state`` before the test client starts so that CI runners — which have
+no ``artifacts/data/returns.parquet`` file — can exercise every code-path without real
+market data.
 """
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from conformal_var.api.main import app
+from conformal_var.api.main import app, app_state
+
+# ---------------------------------------------------------------------------
+# Synthetic dataset shared across the entire test module
+# ---------------------------------------------------------------------------
+
+_SYNTHETIC_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS"]
+_N_DAYS = 1_000  # enough for 252-day rolling windows + 250-day backtest
+
+
+def _make_synthetic_returns() -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2020-01-01", periods=_N_DAYS)
+    data = rng.normal(0.0, 0.015, (_N_DAYS, len(_SYNTHETIC_TICKERS)))
+    return pd.DataFrame(data, index=dates, columns=_SYNTHETIC_TICKERS)
 
 
 @pytest.fixture(scope="module")
-def client() -> TestClient:
-    """Instantiate FastAPI TestClient."""
+def client() -> TestClient:  # type: ignore[return]
+    """TestClient with a synthetic returns DataFrame pre-loaded into ``app_state``."""
+    synthetic = _make_synthetic_returns()
+
+    # Inject synthetic data so the lifespan data-load path is bypassed.
+    # We do this *before* entering the TestClient context manager so the
+    # lifespan ``load_cached_returns`` failure does not clobber our inject.
+    app_state["returns_df"] = synthetic
+    app_state["latest_date"] = str(synthetic.index[-1])[:10]
+
     with TestClient(app) as test_client:
+        # Re-inject after lifespan may have overwritten with None on CI
+        if app_state["returns_df"] is None:
+            app_state["returns_df"] = synthetic
+            app_state["latest_date"] = str(synthetic.index[-1])[:10]
         yield test_client
+
+    # Restore default state after module tests finish
+    app_state["returns_df"] = None
+    app_state["latest_date"] = None
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
 def test_health_endpoint(client: TestClient) -> None:
@@ -32,6 +74,7 @@ def test_health_endpoint(client: TestClient) -> None:
     assert data["cache_backend"] in {"redis", "in_memory_lru"}
     assert "latest_market_date" in data
     assert isinstance(data["available_tickers"], list)
+    # With synthetic data injected, tickers must be present
     assert len(data["available_tickers"]) > 0
 
 
@@ -51,7 +94,7 @@ def test_portfolio_var_valid_request(client: TestClient) -> None:
     # Validate schema fields
     assert "date" in data
     assert data["alpha"] == 0.01
-    assert data["var_return_pct"] < 0.0  # VaR is negative return
+    assert data["var_return_pct"] < 0.0  # VaR is a negative return
     assert data["var_inr"] > 0.0  # INR loss amount is positive
     assert data["expected_shortfall_pct"] <= data["var_return_pct"]  # ES <= VaR
     assert data["expected_shortfall_inr"] >= data["var_inr"]
