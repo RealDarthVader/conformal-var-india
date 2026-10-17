@@ -61,6 +61,22 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 
+[[tool.mypy.overrides]]
+module = [
+    "pandas",
+    "pandas.*",
+    "yfinance",
+    "yfinance.*",
+    "scipy.*",
+    "statsmodels.*",
+    "arch.*",
+    "lightgbm.*",
+    "sklearn.*",
+    "seaborn.*",
+    "redis.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
