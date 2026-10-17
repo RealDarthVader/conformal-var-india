@@ -7,11 +7,13 @@ from conformal_var.models.baselines import (
     HistoricalSimulationVaR,
     RiskMetricsEWMAVaR,
 )
+from conformal_var.models.lgbm_quantile import LightGBMQuantileVaR
 
 __all__ = [
     "BaseVaRForecaster",
     "GARCHNormalVaR",
     "GARCHStudentTVaR",
     "HistoricalSimulationVaR",
+    "LightGBMQuantileVaR",
     "RiskMetricsEWMAVaR",
 ]
