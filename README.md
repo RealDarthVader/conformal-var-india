@@ -1,249 +1,236 @@
-# Uncertainty-Calibrated Value-at-Risk Engine on Indian Equities (`conformal-var-india`)
+# conformal-var-india
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Type Checked: mypy](https://img.shields.io/badge/mypy-strict-blue)](http://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An applied quantitative market-risk framework combining **Conformal Prediction**, **Online Adaptive Conformal Inference (ACI)**, and **LightGBM Quantile Regression** to provide finite-sample, distribution-free Value-at-Risk ($\text{VaR}_\alpha$) and Expected Shortfall ($\text{ES}_\alpha$) calibration on National Stock Exchange (NSE) indices and equities.
+<!-- Add a "Live demo" badge here once the Streamlit app is deployed -->
+
+Value-at-Risk (VaR) and Expected Shortfall (ES) for Indian equities, built by wrapping LightGBM quantile regression in conformal calibration (sliding-window CQR and Adaptive Conformal Inference), then backtested against classical baselines with the tests risk desks actually use (Kupiec, Christoffersen, Basel traffic lights).
+
+**TL;DR**
+
+- Conformal calibration fixes the under-coverage of a raw LightGBM quantile model. Online ACI kept violations near nominal through the YES Bank collapse (6 violations vs. 56 uncalibrated).
+- It does **not** beat a well-tuned GARCH(1,1)-Student-t on the full Nifty 50 sample. GARCH-t has the lowest pinball loss and the narrowest bands; the conformal variants buy better coverage with roughly 35-40% wider bands at the 1% level.
+- In the YES Bank crash, GARCH-t was not statistically rejected (12 violations, Kupiec p = 0.115). ACI had fewer violations (6) at about 67% wider bands.
 
 ---
 
-## Table of Contents
+## Contents
 
-1. [Executive Summary & Research Verdict](#1-executive-summary--research-verdict)
-2. [Mathematical Formulation](#2-mathematical-formulation)
-3. [Empirical Results Across Market Regimes](#3-empirical-results-across-market-regimes)
-4. [Diagnostic Visualizations](#4-diagnostic-visualizations)
-5. [Explicit Limitations & Theoretical Caveats](#5-explicit-limitations--theoretical-caveats)
-6. [System Architecture & Production Packaging](#6-system-architecture--production-packaging)
-7. [Quickstart & Verification](#7-quickstart--verification)
-
----
-
-## 1. Executive Summary & Research Verdict
-
-### Core Research Question
-
-> *"Does Online Adaptive Conformal Inference (ACI) wrapped around machine learning quantile regressors actually beat a well-tuned $\text{GARCH}(1,1)\text{-Student-}t$ or volatility-scaled residual band on emerging market equity tails?"*
-
-### Empirical Verdict
-
-Testing across **15+ years (3,356 out-of-sample trading days)** of NSE data reveals a clear regime dichotomy between diversified index tails and idiosyncratic single-stock collapses:
-
-1. **Diversified Index Tails (`^NSEI`, $\alpha = 0.01$): Volatility-Scaled Conformal & Sliding CQR Dominate**
-   - On the Nifty 50 index at the $99\%$ confidence level ($\alpha = 0.01$), parametric $\text{GARCH}(1,1)\text{-Student-}t$ achieves $98.63\%$ empirical coverage but falls just short of the $95\%$ Kupiec unconditional coverage threshold ($p = 0.0452$).
-   - **LightGBM + Vol-Scaled ACI** ($98.72\%$ coverage, Kupiec $p = 0.1276$, sharpness $0.0311$) and **LightGBM + Sliding CQR** ($98.88\%$ coverage, Kupiec $p = 0.4846$, sharpness $0.0315$) pass both institutional coverage backtests and the Basel Green Zone criteria. When volatility clustering is primarily second-order heteroscedasticity without structural breakdown, normalizing conformity residuals by local conditional volatility $\hat{\sigma}_t$ yields the most efficient calibration.
-
-2. **Idiosyncratic Left-Tail Collapses (`YESBANK.NS` 2018–2020 Crash, $\alpha = 0.01$): Unscaled Online ACI Dominate**
-   - During the YES Bank liquidity collapse (which included single-day log-return shocks of $-0.8235$, or $-56.1\%$ simple return), uncalibrated LightGBM suffered **56 violations** over 736 trading days ($92.39\%$ coverage, Kupiec $p = 0.0000$, Basel Red Zone).
-   - **LightGBM + Online ACI ($\gamma = 0.01$)** cut tail violations by **$89\%$ (down to 6 violations)**, maintaining **$99.18\%$ empirical coverage** (Basel Green Zone, Kupiec $p = 0.6027$, Christoffersen Independence $p = 0.7533$).
-   - Crucially, **Online ACI achieved $2\times$ sharper risk bands ($0.2180$) than Vol-Scaled ACI ($0.4477$)** during the crash. Dividing conformity residuals by realized volatility after an extreme tail shock causes volatility-scaled bands to over-inflate, whereas Online ACI adjusts the effective quantile level $\alpha_t$ directly without variance distortion.
+1. [Findings](#1-findings)
+2. [Method](#2-method)
+3. [Evaluation protocol](#3-evaluation-protocol)
+4. [Results](#4-results)
+5. [Limitations](#5-limitations)
+6. [Future work](#6-future-work)
+7. [Architecture](#7-architecture)
+8. [Quickstart](#8-quickstart)
 
 ---
 
-## 2. Mathematical Formulation
+## 1. Findings
 
-### 2.1 Causal Quantile Loss & Signed Conformity Residual
+**Research question.** Does Adaptive Conformal Inference wrapped around a machine-learning quantile regressor beat a well-tuned GARCH(1,1)-Student-t or a volatility-scaled residual band on Indian equity tails?
 
-Let $r_t = \ln(P_t / P_{t-1})$ denote the realized daily log return of an asset at day $t$, and let $X_t \in \mathcal{F}_{t-1}$ denote the causal feature vector strictly observable prior to market close on day $t-1$.
+**Data.** 3,356 out-of-sample trading days (about 13 years) on the Nifty 50 index (`^NSEI`), plus a single-stock stress test on `YESBANK.NS` (2018-2020, 736 days).
 
-The asymmetric quantile pinball loss for target miscoverage rate $\alpha \in (0, 1)$ and predicted quantile $\hat{v}_t$ is:
+**Answer: not on the full sample, but conformal calibration solves a real problem.**
 
-$$\mathcal{L}_\alpha(r_t, \hat{v}_t) = \left(\alpha - \mathbb{I}\{r_t < \hat{v}_t\}\right)(r_t - \hat{v}_t)$$
+1. **Conformal layers repair a miscalibrated ML model.** Uncalibrated LightGBM under-covers at both levels (1% target: 97.81% coverage, Kupiec p = 0.0000). Sliding CQR brings it to 98.88% (p = 0.4846), and the ACI variants bring it to 98.60-98.72%.
+2. **They do not beat GARCH-t on a proper scoring rule.** At the 1% level GARCH-t has the lowest pinball loss of every model (0.000364 vs. 0.000413-0.000436 for the conformal variants) and the narrowest bands among the models with coverage above 98.5% (0.0231 vs. 0.0311-0.0320). At the 5% level the GARCH and EWMA models also have lower pinball loss than every LightGBM variant. GARCH-t is marginally rejected by Kupiec at 1% (p = 0.0452); so is LightGBM + Online ACI (p = 0.0308).
+3. **During the YES Bank collapse, ACI has fewer violations but GARCH-t is not rejected.** Over 736 days at the 1% level, about 7.4 violations are expected. Uncalibrated LightGBM had 56 (Basel Red). GARCH-t had 12 (Kupiec p = 0.1152, Basel Green, mean width 0.1308). Online ACI had 6 (p = 0.6027, mean width 0.2180, about 67% wider than GARCH-t). The sample includes single-day log-return shocks of -0.8235 (-56.1% simple return).
+4. **Volatility scaling did not help in the crash.** Vol-Scaled ACI matched Sliding CQR's violation count (7) at about twice the width (0.4477 vs. 0.2114). The likely cause is that dividing residuals by a volatility estimate that spikes after extreme shocks over-inflates the bands. This is a hypothesis; no ablation here isolates it.
 
-The signed lower-tail conformity residual $s_t$ is defined such that a VaR violation ($r_t < \hat{q}_\alpha(X_t)$) produces a strictly positive score:
-
-$$s_t = \hat{q}_\alpha(X_t) - r_t$$
-
-### 2.2 Sliding-Window Conformal Quantile Calibration (CQR)
-
-Given a rolling calibration window of size $M$, the finite-sample conformal correction threshold is the empirical quantile of recent conformity residuals:
-
-$$\hat{Q}_{1-\alpha}(s) = \text{Quantile}_{\frac{\lceil (M+1)(1-\alpha) \rceil}{M}}\left(\{s_{t-M}, \dots, s_{t-1}\}\right)$$
-
-$$\widehat{\text{VaR}}_t^{\text{conf}}(\alpha) = \hat{q}_\alpha(X_t) - \hat{Q}_{1-\alpha}(s)$$
-
-### 2.3 Online Adaptive Conformal Inference (Gibbs & Candès, 2021)
-
-To account for non-exchangeability, volatility clustering, and structural regime shifts online, ACI dynamically updates the effective miscoverage rate $\alpha_t$ at each step $t$ with step size $\gamma > 0$:
-
-$$\text{err}_t = \mathbb{I}\left\{r_t < \widehat{\text{VaR}}_t^{\text{ACI}}(\alpha)\right\}$$
-
-$$\alpha_{t+1} = \text{clip}\left(\alpha_t + \gamma (\alpha - \text{err}_t), \, \alpha_{\min}, \, \alpha_{\max}\right)$$
-
-For **Volatility-Scaled ACI**, residuals are normalized by causal conditional volatility $\hat{\sigma}_t$:
-
-$$s_t^{\text{scaled}} = \frac{\hat{q}_\alpha(X_t) - r_t}{\hat{\sigma}_t}, \quad \widehat{\text{VaR}}_t^{\text{vol-ACI}}(\alpha) = \hat{q}_\alpha(X_t) - \hat{\sigma}_t \cdot \hat{Q}_{1-\alpha_t}\left(s^{\text{scaled}}\right)$$
-
-### 2.4 Approximated Conformal Expected Shortfall ($\text{ES}_\alpha$)
-
-Because distribution-free conformal guarantees apply to quantiles rather than conditional tail expectations, Expected Shortfall is approximated via numerical integration across a 10-point left-tail quantile grid $\tau_j = \frac{j \cdot \alpha}{10}$:
-
-$$\widehat{\text{ES}}_t(\alpha) \approx \frac{1}{10} \sum_{j=1}^{10} \widehat{\text{VaR}}_t^{\text{ACI}}\left(\frac{j \cdot \alpha}{10}\right)$$
-
-This formulation enforces strict left-tail dominance and quantile monotonicity: $\widehat{\text{ES}}_t(\alpha) \le \widehat{\text{VaR}}_t^{\text{ACI}}(\alpha)$.
-
-### 2.5 Institutional Market-Risk Backtesting Suite
-
-* **Kupiec Proportion of Failures (POF) Likelihood Ratio (Unconditional Coverage):**
-
-$$LR_{\text{uc}} = -2 \ln \left[ \frac{(1-\alpha)^{T-N} \alpha^N}{(1-\hat{p})^{T-N} \hat{p}^N} \right] \sim \chi^2_1$$
-
-* **Christoffersen Markov Independence Likelihood Ratio (Violation Clustering):**
-
-$$LR_{\text{ind}} = -2 \ln \left[ \frac{(1-\pi)^{n_{00}+n_{10}} \pi^{n_{01}+n_{11}}}{(1-\pi_{01})^{n_{00}} \pi_{01}^{n_{01}} (1-\pi_{11})^{n_{10}} \pi_{11}^{n_{11}}} \right] \sim \chi^2_1$$
-
-* **Basel Committee Traffic Light Framework (Standardized for $\alpha = 0.01$ over 250 Trading Days):**
-  - **Green Zone ($0\text{–}4$ violations):** Multiplier $k = 3.00$ (Model Accepted).
-  - **Yellow Zone ($5\text{–}9$ violations):** Multiplier $k \in [3.40, 3.85]$ (Capital Surcharge).
-  - **Red Zone ($\ge 10$ violations):** Multiplier $k = 4.00$ (Model Rejected).
+**What this does not show.** The index results are one series, and the crash result is one stock chosen with hindsight. See [Limitations](#5-limitations) and [Future work](#6-future-work), in particular the missing GARCH-t + ACI ablation, which is the cleanest test of whether the ML base model adds anything beyond the conformal layer.
 
 ---
 
-## 3. Empirical Results Across Market Regimes
+## 2. Method
 
-### Table 1: 10-Year Out-of-Sample Performance on Nifty 50 (`^NSEI`, $T = 3,356$ Days)
+Let `r_t = ln(P_t / P_{t-1})` be the daily log return, and let `X_t` be features observable before day `t` (all features are lagged with `.shift(1)`).
 
-| Model | Target $\alpha$ | Empirical Coverage | Coverage Error | Sharpness ($\Vert{}\overline{\text{VaR}}\Vert{}$) | Pinball Loss | Kupiec $p$-val | Basel Zone ($99\%$ Std)* |
+**Quantile loss.** For miscoverage level α and predicted quantile `v`:
+
+$$\mathcal{L}_\alpha(r_t, v) = \left(\alpha - \mathbb{I}\{r_t < v\}\right)(r_t - v)$$
+
+**Conformity score.** For a lower-tail quantile forecast `q_t` (the LightGBM quantile at level α), a violation `r_t < q_t` gives a positive score:
+
+$$s_t = q_t - r_t$$
+
+**Sliding-window CQR.** With a rolling window of the last `M` scores:
+
+$$\widehat{\text{VaR}}_t = q_t - \hat{Q}_{1-\alpha}\left(\{s_{t-M}, \dots, s_{t-1}\}\right)$$
+
+where `Q̂` is the empirical quantile at level `⌈(M+1)(1-α)⌉ / M`.
+
+**Online ACI (Gibbs & Candès, 2021).** Track an adaptive miscoverage level `α_t` with step size γ:
+
+$$\widehat{\text{VaR}}_t = q_t - \hat{Q}_{1-\alpha_t}(s), \qquad \text{err}_t = \mathbb{I}\{r_t < \widehat{\text{VaR}}_t\}$$
+
+$$\alpha_{t+1} = \text{clip}\left(\alpha_t + \gamma(\alpha - \text{err}_t),\ \alpha_{\min},\ \alpha_{\max}\right)$$
+
+A violation lowers `α_t`, which widens the next band; a run of non-violations raises it.
+
+**Volatility-scaled ACI.** Scores are normalized by a causal volatility estimate `σ_t`:
+
+$$s_t^{\text{scaled}} = \frac{q_t - r_t}{\sigma_t}, \qquad \widehat{\text{VaR}}_t = q_t - \sigma_t \cdot \hat{Q}_{1-\alpha_t}(s^{\text{scaled}})$$
+
+**Expected Shortfall (approximation).** Conformal methods calibrate quantiles, not tail expectations, so ES is approximated by averaging ACI quantiles over a 10-point grid `τ_j = jα/10`:
+
+$$\widehat{\text{ES}}_t(\alpha) \approx \frac{1}{10}\sum_{j=1}^{10} \widehat{\text{VaR}}_t(\tau_j)$$
+
+By construction `ES ≤ VaR` in return space. See the ES limitation below.
+
+**Backtests.**
+
+- **Kupiec POF** tests unconditional coverage (violation rate equals α).
+- **Christoffersen** tests independence of violations (no clustering).
+- **Basel traffic lights** are defined for 99% VaR over 250 trading days: Green 0-4 violations, Yellow 5-9, Red 10 or more. They are not applied at α = 0.05.
+
+---
+
+## 3. Evaluation protocol
+
+All results are out-of-sample. The items below define how the numbers were produced.
+
+- **Data source and snapshot:** [TODO: source, adjusted vs. raw prices, snapshot date]
+- **Training and retraining:** [TODO: walk-forward scheme and LightGBM retraining frequency]
+- **Hyperparameter selection:** [TODO: how γ, `M`, `α_min`, `α_max` and the LightGBM parameters were chosen, and on which period. Confirm none were tuned on the test period]
+- **Basel zone assignment:** [TODO: how zones are assigned for samples longer than 250 days, e.g. violations scaled to a 250-day equivalent or worst rolling window]
+
+---
+
+## 4. Results
+
+### Table 1: Nifty 50 (`^NSEI`), 3,356 out-of-sample days
+
+Bold marks the best value in each block for coverage error, pinball loss (lower is better), and Kupiec p-value.
+
+| Model | Target α | Coverage | Coverage error | Mean width | Pinball loss | Kupiec p | Basel zone † |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Historical Simulation (252d) | $0.05$ | $94.32\%$ | $0.68\%$ | $0.0148$ | $0.001224$ | $0.0800$ | N/A ($\alpha=0.05$) |
-| RiskMetrics EWMA ($\lambda=0.94$) | $0.05$ | $94.20\%$ | $0.80\%$ | $0.0151$ | $0.001138$ | $0.0397$ | N/A ($\alpha=0.05$) |
-| $\text{GARCH}(1,1)$-Normal | $0.05$ | $94.84\%$ | $0.16\%$ | $0.0154$ | $0.001138$ | $0.6704$ | N/A ($\alpha=0.05$) |
-| $\text{GARCH}(1,1)$-Student-$t$ | $0.05$ | $94.59\%$ | $0.41\%$ | $0.0148$ | $0.001139$ | $0.2918$ | N/A ($\alpha=0.05$) |
-| Uncalibrated LightGBM | $0.05$ | $93.20\%$ | $1.80\%$ | $0.0137$ | $0.001238$ | $0.0000$ | N/A ($\alpha=0.05$) |
-| **LightGBM + Online ACI** | $0.05$ | **$94.90\%$** | **$0.10\%$** | $0.0178$ | $0.001218$ | **$0.7895$** | N/A ($\alpha=0.05$) |
-| **LightGBM + Vol-Scaled ACI** | $0.05$ | **$94.93\%$** | **$0.07\%$** | $0.0188$ | $0.001248$ | **$0.8513$** | N/A ($\alpha=0.05$) |
-| Historical Simulation (252d) | $0.01$ | $98.24\%$ | $0.76\%$ | $0.0258$ | $0.000444$ | $0.0001$ | Green |
-| RiskMetrics EWMA ($\lambda=0.94$) | $0.01$ | $98.03\%$ | $0.97\%$ | $0.0214$ | $0.000372$ | $0.0000$ | Yellow |
-| $\text{GARCH}(1,1)$-Normal | $0.01$ | $98.30\%$ | $0.70\%$ | $0.0217$ | $0.000368$ | $0.0002$ | Green |
-| $\text{GARCH}(1,1)$-Student-$t$ | $0.01$ | $98.63\%$ | $0.37\%$ | $0.0231$ | $0.000364$ | $0.0452$ | Green |
-| Uncalibrated LightGBM | $0.01$ | $97.81\%$ | $1.19\%$ | $0.0222$ | $0.000480$ | $0.0000$ | Yellow |
-| **LightGBM + Sliding CQR** | $0.01$ | **$98.88\%$** | **$0.12\%$** | $0.0315$ | $0.000435$ | **$0.4846$** | **Green** |
-| **LightGBM + Online ACI** | $0.01$ | $98.60\%$ | $0.40\%$ | $0.0320$ | $0.000436$ | $0.0308$ | **Green** |
-| **LightGBM + Vol-Scaled ACI** | $0.01$ | **$98.72\%$** | **$0.28\%$** | $0.0311$ | $0.000413$ | **$0.1276$** | **Green** |
+| Historical Simulation (252d) | 0.05 | 94.32% | 0.68% | 0.0148 | 0.001224 | 0.0800 | N/A |
+| RiskMetrics EWMA (λ=0.94) | 0.05 | 94.20% | 0.80% | 0.0151 | **0.001138** | 0.0397 | N/A |
+| GARCH(1,1)-Normal | 0.05 | 94.84% | 0.16% | 0.0154 | **0.001138** | 0.6704 | N/A |
+| GARCH(1,1)-Student-t | 0.05 | 94.59% | 0.41% | 0.0148 | 0.001139 | 0.2918 | N/A |
+| Uncalibrated LightGBM | 0.05 | 93.20% | 1.80% | 0.0137 | 0.001238 | 0.0000 | N/A |
+| LightGBM + Online ACI | 0.05 | 94.90% | 0.10% | 0.0178 | 0.001218 | 0.7895 | N/A |
+| LightGBM + Vol-Scaled ACI | 0.05 | 94.93% | **0.07%** | 0.0188 | 0.001248 | **0.8513** | N/A |
+| Historical Simulation (252d) | 0.01 | 98.24% | 0.76% | 0.0258 | 0.000444 | 0.0001 | Green |
+| RiskMetrics EWMA (λ=0.94) | 0.01 | 98.03% | 0.97% | 0.0214 | 0.000372 | 0.0000 | Yellow |
+| GARCH(1,1)-Normal | 0.01 | 98.30% | 0.70% | 0.0217 | 0.000368 | 0.0002 | Green |
+| GARCH(1,1)-Student-t | 0.01 | 98.63% | 0.37% | 0.0231 | **0.000364** | 0.0452 | Green |
+| Uncalibrated LightGBM | 0.01 | 97.81% | 1.19% | 0.0222 | 0.000480 | 0.0000 | Yellow |
+| LightGBM + Sliding CQR | 0.01 | 98.88% | **0.12%** | 0.0315 | 0.000435 | **0.4846** | Green |
+| LightGBM + Online ACI | 0.01 | 98.60% | 0.40% | 0.0320 | 0.000436 | 0.0308 | Green |
+| LightGBM + Vol-Scaled ACI | 0.01 | 98.72% | 0.28% | 0.0311 | 0.000413 | 0.1276 | Green |
 
-*\*Note: The Basel Committee Traffic Light framework ($0\text{–}4$ Green, $5\text{–}9$ Yellow, $\ge 10$ Red per 250 trading days) is defined strictly for $99\%$ VaR ($\alpha = 0.01$). Models pass unconditional coverage at the $95\%$ statistical confidence level when $\text{Kupiec } p \ge 0.05$.*
+Notes:
 
-### Table 2: Single-Stock Left-Tail Collapse Stress Test — `YESBANK.NS` (2018–2020, $\alpha = 0.01$, $T = 736$ Days)
+- A Kupiec p-value below 0.05 rejects correct unconditional coverage. At the 1% level, GARCH-t (0.0452) and LightGBM + Online ACI (0.0308) are rejected at the 5% significance level, along with several other models.
+- "Mean width" is the average VaR magnitude; narrower is better only at comparable coverage.
+- † Basel zones apply to 99% VaR only. See [Evaluation protocol](#3-evaluation-protocol) for how zones are assigned over the full sample.
 
-| Model | Empirical Coverage | Violations (736 Days) | Sharpness ($\Vert{}\overline{\text{VaR}}\Vert{}$) | Kupiec $p$-val | Christoffersen $p$-val | Basel Traffic Light |
+### Table 2: `YESBANK.NS` left-tail collapse (2018-2020, α = 0.01, 736 days)
+
+Expected violations at the nominal rate: about 7.4.
+
+| Model | Coverage | Violations | Mean width | Kupiec p | Christoffersen p | Basel zone † |
 | --- | --- | --- | --- | --- | --- | --- |
-| Uncalibrated LightGBM | $92.39\%$ | $56$ | $0.0732$ | $0.0000$ | $0.0000$ | Red (Rejected) |
-| RiskMetrics EWMA ($\lambda=0.94$) | $97.55\%$ | $18$ | $0.1183$ | $0.0009$ | $0.4557$ | Yellow |
-| Historical Simulation (252d) | $97.96\%$ | $15$ | $0.1240$ | $0.0131$ | $0.0333$ | Yellow |
-| $\text{GARCH}(1,1)$-Student-$t$ | $98.37\%$ | $12$ | $0.1308$ | $0.1152$ | $0.1840$ | Green |
-| **LightGBM + Sliding CQR** | **$99.05\%$** | **$7$** | $0.2114$ | **$0.8930$** | **$0.7137$** | **Green (Accepted)** |
-| **LightGBM + Online ACI ($\gamma=0.01$)** | **$99.18\%$** | **$6$** | **$0.2180$** | **$0.6027$** | **$0.7533$** | **Green (Accepted)** |
-| **LightGBM + Vol-Scaled ACI** | **$99.05\%$** | **$7$** | $0.4477$ | **$0.8930$** | **$0.7137$** | **Green (Accepted)** |
+| Uncalibrated LightGBM | 92.39% | 56 | 0.0732 | 0.0000 | 0.0000 | Red |
+| RiskMetrics EWMA (λ=0.94) | 97.55% | 18 | 0.1183 | 0.0009 | 0.4557 | Yellow |
+| Historical Simulation (252d) | 97.96% | 15 | 0.1240 | 0.0131 | 0.0333 | Yellow |
+| GARCH(1,1)-Student-t | 98.37% | 12 | 0.1308 | 0.1152 | 0.1840 | Green |
+| LightGBM + Sliding CQR | 99.05% | 7 | 0.2114 | 0.8930 | 0.7137 | Green |
+| LightGBM + Online ACI (γ=0.01) | 99.18% | 6 | 0.2180 | 0.6027 | 0.7533 | Green |
+| LightGBM + Vol-Scaled ACI | 99.05% | 7 | 0.4477 | 0.8930 | 0.7137 | Green |
+
+The conformal variants land closest to the expected violation count, and GARCH-t is not rejected, so the real difference between them is band width: the conformal bands are 62-71% wider than GARCH-t's, and Vol-Scaled ACI about 3.4 times wider.
+
+Diagnostic plots (crash replay with the `α_t` trajectory, coverage vs. width) are generated by `scripts/generate_plots.py` into `artifacts/plots/` and shown interactively in the Streamlit demo. Per-regime scorecards are in `artifacts/`.
 
 ---
 
-## 4. Diagnostic Visualizations
+## 5. Limitations
 
-### March 2020 COVID-19 Crash Backtest
-
-![COVID-19 Crash Backtest](artifacts/plots/march_2020_crash_backtest.png)
-
-*Figure 1: Daily Nifty 50 returns during the March 2020 liquidity shock overlaid with $99\%$ VaR envelopes. The bottom panel tracks the online trajectory of $\alpha_t$, demonstrating automatic tail-band expansion immediately following clustered violations.*
-
-### Coverage vs. Sharpness Pareto Frontier
-
-![Pareto Frontier](artifacts/plots/coverage_vs_sharpness_pareto.png)
-
-*Figure 2: Empirical coverage error ($\vert{}\hat{\alpha} - \alpha\vert{}$) vs. mean VaR band width (sharpness) over 10-year out-of-sample testing on Nifty 50.*
-
-### Basel Traffic Light Failure Rates by Market Regime
-
-![Basel Violations by Regime](artifacts/plots/basel_violations_by_regime.png)
-
-*Figure 3: Empirical violation rates across four Indian market regimes (`calm_bull`, `ilfs_liquidity_crisis`, `covid_crash`, `rate_hike_tightening`) benchmarked against nominal $1\%$ and Basel regulatory thresholds.*
+1. **Exchangeability.** Classical conformal guarantees assume exchangeable data. Returns violate this through volatility clustering and regime shifts. ACI relaxes the assumption but only guarantees long-run average coverage.
+2. **The ACI guarantee is loose at this sample size.** The worst-case bound on the gap between average violation rate and α is `(max(α₁, 1-α₁) + γ) / (γT)`. With γ = 0.01 and T = 3,356 this is about 3 percentage points, which is larger than the 1% target. The empirical results, not the theorem, carry the evidence. Clipping `α_t` can also weaken the guarantee.
+3. **Marginal vs. conditional coverage.** Average coverage over time does not imply correct coverage conditional on today's market state. Violation clustering is tested with Christoffersen, which is reported for the stress test but not yet for the index table.
+4. **Limited breadth and hindsight selection.** The main table is one index. The stress test is one stock chosen after the fact because it collapsed. `YESBANK.NS`, `IDEA.NS` and `ZEEL.NS` are stressed names, not point-in-time index constituents, so this does not remove survivorship bias. Results across a broad cross-section of stocks are not yet reported.
+5. **Weak ML base model.** Uncalibrated LightGBM has worse pinball loss than GARCH-t (0.000480 vs. 0.000364 at 1%). The conformal layer fixes calibration, not the quality of the underlying quantile forecast.
+6. **Expected Shortfall.** The 10-point grid uses right-endpoint levels `jα/10` and excludes the extreme tail, which biases ES toward milder values; a midpoint or finer grid would reduce this. ES is not backtested (for example with a joint VaR-ES score).
 
 ---
 
-## 5. Explicit Limitations & Theoretical Caveats
+## 6. Future work
 
-1. **Exchangeability Breakdown in Financial Time Series:**
-   - Classical Split Conformal Prediction relies on exchangeability of calibration and test residuals. Equity log returns violate exchangeability via volatility clustering, leverage effects, and macroeconomic regime shifts.
-   - While Online ACI guarantees asymptotic long-run coverage $\lim_{T \to \infty} \frac{1}{T} \sum_{t=1}^T \text{err}_t = \alpha$ without distributional assumptions, finite-sample conditional coverage $\mathbb{P}(r_t < \text{VaR}_t \mid \mathcal{F}_{t-1})$ can still experience transient deviations during abrupt liquidity shocks.
-
-2. **Asymptotic Marginal vs. Conditional Coverage:**
-   - Standard conformal bounds guarantee marginal coverage across time. Market-risk desks care about conditional independence of violations (tested via Christoffersen's $LR_{\text{ind}}$). Sliding-window CQR and Online ACI reduce violation clustering compared to static calibration, but depend on the choice of step size $\gamma$ and window length $M$.
-
-3. **Survivorship Bias Mitigation:**
-   - Evaluating risk models exclusively on current index constituents introduces survivorship bias by censoring bankruptcies and delistings. This pipeline explicitly incorporates distressed historical NSE constituents (`YESBANK.NS`, `IDEA.NS`, `ZEEL.NS`) to stress-test left-tail collapse behavior.
-
-4. **Expected Shortfall Approximation:**
-   - Conformal prediction calibrates quantiles ($\text{VaR}_\alpha$) rather than conditional expectations beyond the quantile. Expected Shortfall ($\text{ES}_\alpha$) is therefore approximated numerically via a 10-point tail quantile grid rather than derived from a parametric tail density.
+- **GARCH-t + ACI:** conformalize the GARCH-t quantile instead of LightGBM. This directly tests whether the ML model adds anything beyond the conformal layer.
+- **Cross-sectional evaluation:** run all models on every Nifty 50 stock using point-in-time constituents, and report the fraction passing Kupiec and Christoffersen.
+- **Christoffersen on the index table** and a conditional coverage joint test.
+- **ES backtesting** and a midpoint or finer ES grid.
+- **Sensitivity** to γ, `M` and `α_min`/`α_max`.
 
 ---
 
-## 6. System Architecture & Production Packaging
+## 7. Architecture
 
 ```text
 conformal-var-india/
 ├── src/conformal_var/
-│   ├── config.py         # Strict Pydantic v2 configuration schema
-│   ├── data/loader.py    # Survivorship-aware NSE data pipeline (Parquet cache)
-│   ├── features/         # Causal lag volatility & tail features (.shift(1))
+│   ├── config.py         # Pydantic v2 configuration schema
+│   ├── data/loader.py    # NSE data pipeline (Parquet cache)
+│   ├── features/         # Causal lagged volatility and tail features (.shift(1))
 │   ├── models/           # Historical Simulation, RiskMetrics, GARCH, LightGBM
 │   ├── conformal/        # Split, Sliding CQR, Online ACI, Vol-Scaled ACI
-│   ├── backtest/         # Kupiec POF, Christoffersen Markov, Basel Traffic Light
-│   ├── portfolio/        # Multi-asset return aggregation, Conformal ES grid
-│   └── api/              # Production FastAPI service with Redis/LRU cache
-├── streamlit_app.py      # Interactive 3-tab zero-compute Streamlit demo
-├── artifacts/            # Parquet datasets, diagnostic plots, regime scorecards
-├── scripts/              # Data ingestion, demo precompute, benchmark runner, plot generators
-├── tests/                # 90 Pytest analytical, leakage & integration tests
-├── Dockerfile            # Multi-stage production container (API & Demo targets)
-└── docker-compose.yml    # FastAPI + Redis 7 + Streamlit service stack
+│   ├── backtest/         # Kupiec POF, Christoffersen, Basel traffic light
+│   ├── portfolio/        # Multi-asset return aggregation, ES grid
+│   └── api/              # FastAPI service with Redis/LRU cache
+├── streamlit_app.py      # Three-tab Streamlit demo (precomputed, no model fitting)
+├── artifacts/            # Parquet datasets, plots, regime scorecards
+├── scripts/              # Ingestion, demo precompute, experiments, plots
+├── tests/                # 90 pytest tests: analytical, leakage, integration
+├── Dockerfile            # Multi-stage container (API and demo targets)
+└── docker-compose.yml    # FastAPI + Redis 7 + Streamlit
 ```
 
 ---
 
-## 7. Quickstart & Verification
+## 8. Quickstart
 
-### Local Setup & Automated Test Suite
+### Install and test
 
 ```bash
-# Clone the repository and install dependencies
 git clone https://github.com/RealDarthVader/conformal-var-india.git
 cd conformal-var-india
 pip install -r requirements.txt
 
-# Run the complete verification suite (90 passing unit & statistical tests)
-pytest
+pytest                                      # 90 tests
 
-# Regenerate empirical scorecards and diagnostic plots
-python scripts/run_research_experiment.py
-python scripts/generate_plots.py
+python scripts/run_research_experiment.py   # regenerate result tables
+python scripts/generate_plots.py            # regenerate plots
 ```
 
-### Interactive Streamlit Demo (Zero Cold-Start)
+### Streamlit demo
 
 ```bash
-# Precompute predictions once (offline, ~2 minutes)
-python scripts/precompute_demo.py
-
-# Launch the interactive Streamlit application
+python scripts/precompute_demo.py   # one-off, about 2 minutes
 streamlit run streamlit_app.py
 ```
-Open [http://localhost:8501](http://localhost:8501) to explore the **Crash Replay**, **Model Comparison**, and **Portfolio VaR & ES Calculator** tabs.
 
-### Docker Compose Deployment
+Open http://localhost:8501 for the **Crash Replay**, **Model Comparison**, and **Portfolio VaR & ES** tabs.
+
+### Docker
 
 ```bash
-# Build and launch FastAPI microservice, Redis 7 cache, and Streamlit demo
 docker compose up --build -d
-
-# Check service and Redis health
 curl -s http://localhost:8000/health | jq .
 ```
 
-* **Interactive Streamlit Demo:** [http://localhost:8501](http://localhost:8501)
-* **FastAPI Swagger Documentation:** [http://localhost:8000/docs](http://localhost:8000/docs)
+- Streamlit demo: http://localhost:8501
+- FastAPI docs: http://localhost:8000/docs
 
-### API Inference Example: Multi-Asset Portfolio VaR & Expected Shortfall
+### API example: portfolio VaR and ES
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/portfolio/var" \
@@ -257,7 +244,7 @@ curl -X POST "http://localhost:8000/api/v1/portfolio/var" \
      }' | jq .
 ```
 
-### Example JSON Response
+Example response:
 
 ```json
 {
@@ -275,3 +262,9 @@ curl -X POST "http://localhost:8000/api/v1/portfolio/var" \
   "latency_ms": 14.2
 }
 ```
+
+---
+
+## License
+
+MIT
