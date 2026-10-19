@@ -56,6 +56,7 @@ coverage.xml
 # Project specific artifacts (keep folders with .gitkeep, ignore large caches/runs)
 artifacts/data/*.parquet
 artifacts/data/*.csv
+artifacts/demo/*.parquet
 artifacts/plots/*.png
 artifacts/plots/*.svg
 artifacts/plots/*.pdf

@@ -17,6 +17,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: api
     container_name: conformal_var_api
     restart: unless-stopped
     ports:
@@ -29,6 +30,26 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: demo
+    container_name: conformal_var_demo
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app/src
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./.streamlit:/app/.streamlit:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 10s
       timeout: 5s
       retries: 5
